@@ -1,47 +1,80 @@
 import os
 import asyncio
 from pyrogram import Client, filters
-from pyrogram.types import Message
-from pyrogram.enums import ChatMembersFilter
+from pyrogram.types import Message, ChatMemberUpdated
+from pyrogram.enums import ChatMembersFilter, ChatMemberStatus
 from dotenv import load_dotenv
 
-# Load environment variables from .env file
+# Load environment variables
 load_dotenv()
 
-# Configuration from .env with validation
-try:
-    API_ID = int(os.getenv("API_ID"))
-    API_HASH = os.getenv("API_HASH")
-    BOT_TOKEN = os.getenv("BOT_TOKEN")
-    ADMIN_ID = int(os.getenv("ADMIN_ID"))
-    CHANNEL = os.getenv("CHANNEL")  # Can be username or ID string
-    
-    if not all([API_ID, API_HASH, BOT_TOKEN, ADMIN_ID, CHANNEL]):
-        raise ValueError("Missing required environment variables")
-except Exception as e:
-    print(f"Configuration error: {e}")
-    exit(1)
+# Configuration
+API_ID = int(os.getenv("API_ID"))
+API_HASH = os.getenv("API_HASH")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID = int(os.getenv("ADMIN_ID"))
+CHANNEL = os.getenv("CHANNEL")
 
-# Create Pyrogram client
-app = Client(
-    "channel_stats_bot",
-    api_id=API_ID,
-    api_hash=API_HASH,
-    bot_token=BOT_TOKEN
-)
+app = Client("channel_stats_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+
+# Dictionary to track last known admins
+last_known_admins = {}
+
+async def update_admins_list():
+    global last_known_admins
+    try:
+        chat = await app.get_chat(CHANNEL)
+        admins = await app.get_chat_members(chat.id, filter=ChatMembersFilter.ADMINISTRATORS)
+        last_known_admins = {admin.user.id: admin.user.first_name for admin in admins}
+    except Exception as e:
+        print(f"Error updating admin list: {e}")
+
+async def send_admin_notification(banned_user_id):
+    try:
+        banned_user = await app.get_users(banned_user_id)
+        
+        message = (
+            "🚨 A user was banned!\n\n"
+            f"👤 Banned user: {banned_user.mention}\n"
+            f"🆔 User ID: {banned_user.id}\n\n"
+            "Note: Could not determine which admin performed the ban (bot limitation)"
+        )
+        
+        await app.send_message(ADMIN_ID, message)
+    except Exception as e:
+        print(f"Error sending notification: {e}")
+
+@app.on_chat_member_updated()
+async def handle_ban_event(client: Client, chat_member: ChatMemberUpdated):
+    try:
+        # Check if this is our channel
+        chat = await app.get_chat(CHANNEL)
+        if chat_member.chat.id != chat.id:
+            return
+            
+        # Check if user was banned
+        if (chat_member.old_chat_member and chat_member.new_chat_member and
+            chat_member.old_chat_member.status != ChatMemberStatus.BANNED and
+            chat_member.new_chat_member.status == ChatMemberStatus.BANNED):
+            
+            # Update admin list
+            await update_admins_list()
+            
+            # Send notification about the banned user
+            await send_admin_notification(chat_member.new_chat_member.user.id)
+            
+    except Exception as e:
+        print(f"Error handling ban event: {e}")
 
 async def get_channel_stats():
     try:
-        # Get channel info
         chat = await app.get_chat(CHANNEL)
         if not chat:
             print("Error: Could not get channel info")
             return None, None
         
-        # Get members count
         members = await app.get_chat_members_count(chat.id)
         
-        # Get banned users count
         banned_count = 0
         async for _ in app.get_chat_members(chat.id, filter=ChatMembersFilter.BANNED):
             banned_count += 1
@@ -53,6 +86,9 @@ async def get_channel_stats():
         return None, None
 
 async def send_channel_stats():
+    # Initial admin list update
+    await update_admins_list()
+    
     while True:
         members, banned_count = await get_channel_stats()
         
@@ -60,7 +96,8 @@ async def send_channel_stats():
             message = (
                 f"📊 Channel Stats Update:\n\n"
                 f"👥 Members: {members}\n"
-                f"🚫 Banned Users: {banned_count}"
+                f"🚫 Banned Users: {banned_count}\n"
+                f"🛡️ Admins Count: {len(last_known_admins)}"
             )
             
             try:
@@ -68,15 +105,18 @@ async def send_channel_stats():
             except Exception as e:
                 print(f"Error sending message: {e}")
         
-        # Wait for 10 seconds before next update
+        # Update admin list periodically
+        if len(last_known_admins) == 0 or len(message) % 10 == 0:
+            await update_admins_list()
+        
         await asyncio.sleep(10)
 
 @app.on_message(filters.command("start") & filters.private)
 async def start_command(client: Client, message: Message):
     if message.from_user.id == ADMIN_ID:
         await message.reply("🤖 Channel Stats Bot is running!\n\n"
-                          "I will send channel stats every 10 seconds to this chat.")
-        # Start the stats sending loop
+                          "I will send channel stats every 10 seconds to this chat.\n"
+                          "I'll also notify you when users get banned.")
         asyncio.create_task(send_channel_stats())
 
 if __name__ == "__main__":
